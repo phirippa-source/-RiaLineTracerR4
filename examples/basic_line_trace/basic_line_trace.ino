@@ -1,4 +1,4 @@
-#include <RiaLineTracerR4.h>   // library.properties의 includes에 맞춰 설치 시
+#include <riaLineTracerR4.h>   // library.properties의 includes에 맞춰 설치 시
 
 const uint8_t sensorPins[] = { 5, A2, A0, 11, A3, 4 };
 RiaLineTracerR4 tracer(sensorPins, 6, -1);
