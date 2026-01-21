@@ -24,11 +24,17 @@ Place this library folder here:
 Recommended structure:
 
 RiaLineTracerR4/
+
 ├─ library.properties
+
 ├─ README.md
+
 ├─ src/
+
 │  ├─ riaLineTracerR4.h
+
 │  └─ riaLineTracerR4.cpp
+
 └─ examples/
    └─ basic_line_trace/
       └─ basic_line_trace.ino
