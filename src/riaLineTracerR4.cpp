@@ -1,76 +1,91 @@
-#include "riaLineTracerR4.h"
+#include "RiaLineTracerR4.h"
 
-// -------------------- Utility --------------------
-int16_t RiaLineTracerR4::clampI16(int32_t v, int16_t lo, int16_t hi)
-{
-  if (v < lo) return lo;
-  if (v > hi) return hi;
-  return (int16_t)v;
-}
+// -------------------- Constructor / begin --------------------
 
-// -------------------- Constructor --------------------
-RiaLineTracerR4::RiaLineTracerR4(const uint8_t *sensorPins, uint8_t numSensors, int8_t emitterPin)
+RiaLineTracerR4::RiaLineTracerR4(const uint8_t* pins, uint8_t numSensors, int8_t emitterPin)
 : _numSensors(numSensors),
   _emitterPin(emitterPin),
   _emitterAlwaysOn(true),
   _calibrated(false),
   _lastPosition(0),
-  _kp(0.18f), _ki(0.0f), _kd(1.2f),
-  _integral(0.0f), _prevError(0.0f), _hasPrev(false),
+  _lastError(0),
+  _kp(0.08f), _ki(0.0f), _kd(0.0f),
+  _integral(0.0f),
   _integralLimitAbs(1500.0f),
-  _lastStepMicros(0),
-  _lastCorrection(0.0f),
-  _holdLastOnLost(true),
-  _searchOnLost(false),
-  _searchTurn(90),
-  // Default Zumo Shield pins (common mapping)
-  _pinDirL(8), _pinPwmL(10),
-  _pinDirR(7), _pinPwmR(9),
+  _lastDerivInput(0.0f),
+  _lastPidMicros(0),
+  _leftDirPin(8), _leftPwmPin(10), _rightDirPin(7), _rightPwmPin(9),
   _dirLowIsForward(true),
-  _minPwmWhenMoving(0)
+  _minPwmWhenMoving(0),
+  _searchOnLost(false),
+  _holdLastOnLost(true),
+  _searchTurnPwm(90)
 {
   if (_numSensors > MAX_SENSORS) _numSensors = MAX_SENSORS;
 
   for (uint8_t i = 0; i < _numSensors; i++) {
-    _pins[i] = sensorPins[i];
+    _pins[i] = pins[i];
     _calibMin[i] = 0xFFFF;
     _calibMax[i] = 0;
   }
 
   if (_numSensors > 0) {
-    _lastPosition = ((int32_t)(_numSensors - 1) * 1000L) / 2;
+    _lastPosition = (int32_t)(_numSensors - 1) * 1000L / 2; // center
   }
 }
 
-// -------------------- begin --------------------
 void RiaLineTracerR4::begin(bool emitterAlwaysOn)
 {
   _emitterAlwaysOn = emitterAlwaysOn;
 
+  // Emitter
   if (_emitterPin >= 0) {
-    pinMode(_emitterPin, OUTPUT);
-    setEmitter(_emitterAlwaysOn);
+    pinMode((uint8_t)_emitterPin, OUTPUT);
+    digitalWrite((uint8_t)_emitterPin, _emitterAlwaysOn ? HIGH : LOW);
   }
 
+  // Sensor pins default input
   for (uint8_t i = 0; i < _numSensors; i++) {
     pinMode(_pins[i], INPUT);
   }
 
-  initMotorPins();
+  // Motor pins
+  pinMode(_leftDirPin, OUTPUT);
+  pinMode(_leftPwmPin, OUTPUT);
+  pinMode(_rightDirPin, OUTPUT);
+  pinMode(_rightPwmPin, OUTPUT);
 
+  applyMotor(0, 0);
   resetPID();
-  _lastStepMicros = micros();
-  _lastCorrection = 0.0f;
 }
 
-// -------------------- Emitter --------------------
-void RiaLineTracerR4::setEmitter(bool on)
+// -------------------- Emitter helpers --------------------
+
+void RiaLineTracerR4::emitterOn_()
+{
+  if (_emitterPin >= 0) {
+    digitalWrite((uint8_t)_emitterPin, HIGH);
+  }
+}
+
+void RiaLineTracerR4::emitterOff_()
+{
+  if (_emitterPin >= 0) {
+    digitalWrite((uint8_t)_emitterPin, LOW);
+  }
+}
+
+void RiaLineTracerR4::ensureEmitterOnForRead_()
 {
   if (_emitterPin < 0) return;
-  digitalWrite(_emitterPin, on ? HIGH : LOW);
+  if (_emitterAlwaysOn) return;
+
+  emitterOn_();
+  delayMicroseconds(10);
 }
 
 // -------------------- Calibration --------------------
+
 void RiaLineTracerR4::resetCalibration()
 {
   _calibrated = false;
@@ -82,13 +97,13 @@ void RiaLineTracerR4::resetCalibration()
 
 void RiaLineTracerR4::calibrate(uint16_t iterations,
                                 uint16_t timeoutMicros,
-                                uint8_t chargeMicros,
+                                uint8_t  chargeMicros,
                                 uint16_t interDelayMs)
 {
   uint16_t raw[MAX_SENSORS];
 
   for (uint16_t n = 0; n < iterations; n++) {
-    readRawInternal(raw, timeoutMicros, chargeMicros);
+    readRaw(raw, timeoutMicros, chargeMicros);
 
     for (uint8_t i = 0; i < _numSensors; i++) {
       uint16_t v = raw[i];
@@ -102,84 +117,71 @@ void RiaLineTracerR4::calibrate(uint16_t iterations,
     }
 
     _calibrated = true;
-    if (interDelayMs) delay(interDelayMs);
+    if (interDelayMs > 0) delay(interDelayMs);
   }
 }
 
-// -------------------- Sensor reads --------------------
-uint16_t RiaLineTracerR4::readRaw(uint16_t *rawValues, uint16_t timeoutMicros, uint8_t chargeMicros)
+// -------------------- Sensor read (RC timing) --------------------
+
+void RiaLineTracerR4::readRaw(uint16_t* values,
+                              uint16_t timeoutMicros,
+                              uint8_t  chargeMicros)
 {
-  return readRawInternal(rawValues, timeoutMicros, chargeMicros);
-}
+  ensureEmitterOnForRead_();
 
-uint16_t RiaLineTracerR4::readRawInternal(uint16_t *values, uint16_t timeoutMicros, uint8_t chargeMicros)
-{
-  // Safety cap: avoids accidentally huge loop time
-  if (timeoutMicros > 32767) timeoutMicros = 32767;
-
-  // emitter control
-  if (_emitterPin >= 0 && !_emitterAlwaysOn) {
-    setEmitter(true);
-    if (chargeMicros) delayMicroseconds(chargeMicros);
-  }
-
-  // 1) Charge all sensors
+  // 1) Charge: OUTPUT HIGH
   for (uint8_t i = 0; i < _numSensors; i++) {
     pinMode(_pins[i], OUTPUT);
     digitalWrite(_pins[i], HIGH);
   }
-  if (chargeMicros) delayMicroseconds(chargeMicros);
+  if (chargeMicros > 0) delayMicroseconds(chargeMicros);
 
-  // 2) Init with timeout
+  // default = timeout
   for (uint8_t i = 0; i < _numSensors; i++) {
     values[i] = timeoutMicros;
   }
 
-  // 3) Release to input
+  // 2) Switch to INPUT and measure discharge time until LOW
   for (uint8_t i = 0; i < _numSensors; i++) {
     pinMode(_pins[i], INPUT);
   }
 
-  // 4) Discharge timing with early-exit + pending mask
-  const uint32_t start = micros();
-  uint8_t pendingMask = 0;
-  for (uint8_t i = 0; i < _numSensors; i++) pendingMask |= (1u << i);
+  uint16_t pendingMask = 0;
+  for (uint8_t i = 0; i < _numSensors; i++) {
+    pendingMask |= (uint16_t)(1u << i);
+  }
 
-  uint16_t elapsed = 0;
+  const uint32_t start = micros();
 
   while (pendingMask != 0) {
-    elapsed = (uint16_t)(micros() - start);
-    if (elapsed >= timeoutMicros) {
-      elapsed = timeoutMicros;
-      break;
-    }
+    const uint32_t now = micros();
+    const uint32_t elapsed = now - start;
+
+    if (elapsed >= timeoutMicros) break;
 
     for (uint8_t i = 0; i < _numSensors; i++) {
-      const uint8_t bit = (1u << i);
+      const uint16_t bit = (uint16_t)(1u << i);
       if ((pendingMask & bit) == 0) continue;
 
       if (digitalRead(_pins[i]) == LOW) {
-        values[i] = elapsed;
-        pendingMask &= (uint8_t)~bit;
+        values[i] = (uint16_t)elapsed;
+        pendingMask &= (uint16_t)~bit;
         if (pendingMask == 0) break;
       }
     }
   }
 
-  // emitter off (if not always on)
   if (_emitterPin >= 0 && !_emitterAlwaysOn) {
-    setEmitter(false);
+    emitterOff_();
   }
-
-  return elapsed;
 }
 
-void RiaLineTracerR4::readCalibrated(uint16_t *calibratedValues,
+void RiaLineTracerR4::readCalibrated(uint16_t* values,
                                      uint16_t timeoutMicros,
-                                     uint8_t chargeMicros)
+                                     uint8_t  chargeMicros)
 {
   uint16_t raw[MAX_SENSORS];
-  readRawInternal(raw, timeoutMicros, chargeMicros);
+  readRaw(raw, timeoutMicros, chargeMicros);
 
   for (uint8_t i = 0; i < _numSensors; i++) {
     const uint16_t v = raw[i];
@@ -187,32 +189,37 @@ void RiaLineTracerR4::readCalibrated(uint16_t *calibratedValues,
     const uint16_t maxv = _calibMax[i];
 
     if (!_calibrated || maxv <= minv) {
-      calibratedValues[i] = 0;
-    } else {
-      int32_t num = (int32_t)v - (int32_t)minv;
-      if (num < 0) num = 0;
-
-      uint16_t norm = (uint16_t)((num * 1000L) / (maxv - minv));
-      if (norm > 1000) norm = 1000;
-      calibratedValues[i] = norm; // 0..1000 (white..black)
+      values[i] = 0;
+      continue;
     }
+
+    int32_t num = (int32_t)v - (int32_t)minv;
+    if (num < 0) num = 0;
+
+    uint32_t den = (uint32_t)(maxv - minv);
+    uint32_t norm = (uint32_t)num * 1000UL / den;
+    if (norm > 1000UL) norm = 1000UL;
+
+    values[i] = (uint16_t)norm;
   }
 }
 
+// -------------------- Line position --------------------
+
 int32_t RiaLineTracerR4::readLine(bool whiteLine,
                                  uint16_t timeoutMicros,
-                                 uint8_t chargeMicros,
+                                 uint8_t  chargeMicros,
                                  uint16_t noiseThreshold)
 {
-  bool dummyLost = false;
-  return readLineWithStatus(dummyLost, whiteLine, timeoutMicros, chargeMicros, noiseThreshold);
+  bool lost = false;
+  return readLineWithStatus(lost, whiteLine, timeoutMicros, chargeMicros, noiseThreshold);
 }
 
-int32_t RiaLineTracerR4::readLineWithStatus(bool &lineLost,
-                                            bool whiteLine,
-                                            uint16_t timeoutMicros,
-                                            uint8_t chargeMicros,
-                                            uint16_t noiseThreshold)
+int32_t RiaLineTracerR4::readLineWithStatus(bool& lineLost,
+                                           bool whiteLine,
+                                           uint16_t timeoutMicros,
+                                           uint8_t  chargeMicros,
+                                           uint16_t noiseThreshold)
 {
   uint16_t cal[MAX_SENSORS];
   readCalibrated(cal, timeoutMicros, chargeMicros);
@@ -222,7 +229,6 @@ int32_t RiaLineTracerR4::readLineWithStatus(bool &lineLost,
 
   for (uint8_t i = 0; i < _numSensors; i++) {
     uint16_t v = cal[i];
-
     if (whiteLine) v = 1000 - v;
     if (v < noiseThreshold) continue;
 
@@ -232,7 +238,7 @@ int32_t RiaLineTracerR4::readLineWithStatus(bool &lineLost,
 
   if (sum == 0) {
     lineLost = true;
-    return _lastPosition; // keep last
+    return _lastPosition;
   }
 
   lineLost = false;
@@ -240,10 +246,49 @@ int32_t RiaLineTracerR4::readLineWithStatus(bool &lineLost,
   return _lastPosition;
 }
 
+// -------------------- Auto calibration spin --------------------
+
+void RiaLineTracerR4::autoCalibrateSpin(
+    uint16_t loops,
+    int16_t  turnPwm,
+    uint16_t block,
+    uint16_t timeoutMicros,
+    uint8_t  chargeMicros,
+    uint8_t  perLoopDelayMs
+) {
+  if (loops == 0) return;
+  if (block == 0) block = 1;
+
+  resetCalibration();
+
+  for (uint16_t i = 0; i < loops; i++) {
+    const bool dir = ((i / block) % 2 == 0);
+
+    if (dir) applyMotor(+turnPwm, -turnPwm);
+    else     applyMotor(-turnPwm, +turnPwm);
+
+    calibrate(1, timeoutMicros, chargeMicros, 0);
+    if (perLoopDelayMs > 0) delay(perLoopDelayMs);
+  }
+
+  applyMotor(0, 0);
+}
+
 // -------------------- PID --------------------
+
 void RiaLineTracerR4::setPID(float kp, float ki, float kd)
 {
-  _kp = kp; _ki = ki; _kd = kd;
+  _kp = kp;
+  _ki = ki;
+  _kd = kd;
+}
+
+void RiaLineTracerR4::resetPID()
+{
+  _integral = 0.0f;
+  _lastDerivInput = 0.0f;
+  _lastPidMicros = micros();
+  _lastError = 0;
 }
 
 void RiaLineTracerR4::setIntegralLimit(float limitAbs)
@@ -252,47 +297,43 @@ void RiaLineTracerR4::setIntegralLimit(float limitAbs)
   _integralLimitAbs = limitAbs;
 }
 
-void RiaLineTracerR4::resetPID()
+// -------------------- Motor helpers --------------------
+
+uint8_t RiaLineTracerR4::clampPwmAbs_(int32_t v) const
 {
-  _integral = 0.0f;
-  _prevError = 0.0f;
-  _hasPrev = false;
+  if (v < 0) v = -v;
+  if (v > 255) v = 255;
+  return (uint8_t)v;
 }
 
-float RiaLineTracerR4::pidUpdate(float error, float dtSeconds)
+int16_t RiaLineTracerR4::clampMotor_(int32_t v, int16_t maxAbs) const
 {
-  if (dtSeconds <= 0.0f) dtSeconds = 0.001f;
-
-  // integral (anti-windup)
-  _integral += error * dtSeconds;
-  if (_integral > _integralLimitAbs) _integral = _integralLimitAbs;
-  if (_integral < -_integralLimitAbs) _integral = -_integralLimitAbs;
-
-  float derivative = 0.0f;
-  if (_hasPrev) {
-    derivative = (error - _prevError) / dtSeconds;
-  } else {
-    _hasPrev = true;
-  }
-  _prevError = error;
-
-  return (_kp * error) + (_ki * _integral) + (_kd * derivative);
+  if (v >  maxAbs) v =  maxAbs;
+  if (v < -maxAbs) v = -maxAbs;
+  return (int16_t)v;
 }
 
-// -------------------- Line-lost strategy --------------------
-void RiaLineTracerR4::setHoldLastOnLost(bool enable) { _holdLastOnLost = enable; }
-void RiaLineTracerR4::setSearchOnLost(bool enable) { _searchOnLost = enable; }
-void RiaLineTracerR4::setSearchTurn(int16_t turn) { _searchTurn = turn; }
-
-// -------------------- Motor PWM --------------------
-void RiaLineTracerR4::setMotorPins(uint8_t leftDirPin, uint8_t leftPwmPin,
-                                   uint8_t rightDirPin, uint8_t rightPwmPin)
+int32_t RiaLineTracerR4::roundToInt_(float x) const
 {
-  _pinDirL = leftDirPin;
-  _pinPwmL = leftPwmPin;
-  _pinDirR = rightDirPin;
-  _pinPwmR = rightPwmPin;
-  initMotorPins();
+  // avoid libm dependency differences; stable rounding
+  return (x >= 0.0f) ? (int32_t)(x + 0.5f) : (int32_t)(x - 0.5f);
+}
+
+// -------------------- Motor --------------------
+
+void RiaLineTracerR4::setMotorPins(uint8_t leftDir, uint8_t leftPwm, uint8_t rightDir, uint8_t rightPwm)
+{
+  _leftDirPin = leftDir;
+  _leftPwmPin = leftPwm;
+  _rightDirPin = rightDir;
+  _rightPwmPin = rightPwm;
+
+  pinMode(_leftDirPin, OUTPUT);
+  pinMode(_leftPwmPin, OUTPUT);
+  pinMode(_rightDirPin, OUTPUT);
+  pinMode(_rightPwmPin, OUTPUT);
+
+  applyMotor(0, 0);
 }
 
 void RiaLineTracerR4::setDirPolarity(bool lowIsForward)
@@ -305,112 +346,111 @@ void RiaLineTracerR4::setMinPwmWhenMoving(uint8_t minPwm)
   _minPwmWhenMoving = minPwm;
 }
 
-void RiaLineTracerR4::initMotorPins()
-{
-  pinMode(_pinDirL, OUTPUT);
-  pinMode(_pinDirR, OUTPUT);
-  pinMode(_pinPwmL, OUTPUT);
-  pinMode(_pinPwmR, OUTPUT);
-
-  // default safe stop
-  analogWrite(_pinPwmL, 0);
-  analogWrite(_pinPwmR, 0);
-}
-
-uint8_t RiaLineTracerR4::clampPwmFromCommand(int16_t cmd) const
-{
-  int32_t a = cmd;
-  if (a < 0) a = -a;
-
-  if (a > 255) a = 255;
-
-  if (a > 0 && _minPwmWhenMoving > 0 && a < _minPwmWhenMoving) {
-    a = _minPwmWhenMoving;
-  }
-  return (uint8_t)a;
-}
-
-void RiaLineTracerR4::setOneMotor(uint8_t pinDir, uint8_t pinPwm, int16_t cmd)
-{
-  if (cmd == 0) {
-    analogWrite(pinPwm, 0);
-    return;
-  }
-
-  const bool reverse = (cmd < 0);
-
-  // direction polarity
-  // lowIsForward=true:
-  //   forward => LOW, reverse => HIGH
-  // lowIsForward=false:
-  //   forward => HIGH, reverse => LOW
-  const bool dirLevel = _dirLowIsForward ? reverse : !reverse;
-  digitalWrite(pinDir, dirLevel ? HIGH : LOW);
-
-  const uint8_t pwm = clampPwmFromCommand(cmd);
-  analogWrite(pinPwm, pwm);
-}
-
 void RiaLineTracerR4::applyMotor(int16_t left, int16_t right)
 {
-  setOneMotor(_pinDirL, _pinPwmL, left);
-  setOneMotor(_pinDirR, _pinPwmR, right);
+  // Left motor
+  const bool leftForward = (left >= 0);
+  uint8_t leftPwm = clampPwmAbs_(left);
+  if (leftPwm > 0 && _minPwmWhenMoving > 0 && leftPwm < _minPwmWhenMoving) {
+    leftPwm = _minPwmWhenMoving;
+  }
+
+  uint8_t leftDirLevel = 0;
+  if (_dirLowIsForward) leftDirLevel = leftForward ? LOW : HIGH;
+  else                 leftDirLevel = leftForward ? HIGH : LOW;
+
+  digitalWrite(_leftDirPin, leftDirLevel);
+  analogWrite(_leftPwmPin, leftPwm);
+
+  // Right motor
+  const bool rightForward = (right >= 0);
+  uint8_t rightPwm = clampPwmAbs_(right);
+  if (rightPwm > 0 && _minPwmWhenMoving > 0 && rightPwm < _minPwmWhenMoving) {
+    rightPwm = _minPwmWhenMoving;
+  }
+
+  uint8_t rightDirLevel = 0;
+  if (_dirLowIsForward) rightDirLevel = rightForward ? LOW : HIGH;
+  else                 rightDirLevel = rightForward ? HIGH : LOW;
+
+  digitalWrite(_rightDirPin, rightDirLevel);
+  analogWrite(_rightPwmPin, rightPwm);
 }
 
-// -------------------- step() --------------------
-RiaLineTracerR4::MotorCommand RiaLineTracerR4::step(int16_t baseSpeed,
-                                                    int16_t maxSpeed,
-                                                    bool whiteLine,
-                                                    uint16_t timeoutMicros,
-                                                    uint8_t chargeMicros,
-                                                    uint16_t noiseThreshold)
+// -------------------- Lost-line policy --------------------
+
+void RiaLineTracerR4::setSearchOnLost(bool enable)   { _searchOnLost = enable; }
+void RiaLineTracerR4::setHoldLastOnLost(bool enable) { _holdLastOnLost = enable; }
+void RiaLineTracerR4::setSearchTurn(int16_t turnPwm) { _searchTurnPwm = turnPwm; }
+
+// -------------------- High-level step --------------------
+
+RiaLineTracerR4::StepCommand RiaLineTracerR4::step(int16_t baseSpeed,
+                                                   int16_t maxSpeed,
+                                                   bool whiteLine,
+                                                   uint16_t timeoutMicros,
+                                                   uint8_t  chargeMicros,
+                                                   uint16_t noiseThreshold)
 {
-  const uint32_t now = micros();
-  float dt = (now - _lastStepMicros) / 1000000.0f;
-  _lastStepMicros = now;
+  StepCommand out{};
+  bool lost = false;
 
-  bool lineLost = false;
-  const int32_t pos = readLineWithStatus(lineLost, whiteLine, timeoutMicros, chargeMicros, noiseThreshold);
+  const int32_t pos = readLineWithStatus(lost, whiteLine, timeoutMicros, chargeMicros, noiseThreshold);
+  out.lineLost = lost;
+  out.position = pos;
 
-  const int32_t center = ((int32_t)(_numSensors - 1) * 1000L) / 2;
-  int32_t err32 = pos - center;
+  const int32_t center = (int32_t)(_numSensors - 1) * 1000L / 2;
+  int32_t error = pos - center;
 
-  float correction = pidUpdate((float)err32, dt);
-
-  // lineLost handling
-  if (lineLost) {
+  // Lost-line handling
+  if (lost) {
     if (_searchOnLost) {
-      correction = (float)_searchTurn;
-    } else if (_holdLastOnLost) {
-      correction = _lastCorrection;
-    } else {
-      correction = 0.0f;
+      const int16_t t = _searchTurnPwm;
+      if (_lastError < 0) { out.left = -t; out.right = +t; }
+      else               { out.left = +t; out.right = -t; }
+
+      applyMotor(out.left, out.right);
+      out.error = error;
+      return out;
     }
+
+    if (_holdLastOnLost) error = _lastError;
+    else                error = 0;
   }
-  _lastCorrection = correction;
 
-  // motor mix
-  int32_t left  = (int32_t)baseSpeed + (int32_t)correction;
-  int32_t right = (int32_t)baseSpeed - (int32_t)correction;
+  out.error = error;
 
-  // clamp by maxSpeed then by PWM(255)
-  if (maxSpeed < 0) maxSpeed = -maxSpeed;
-  if (maxSpeed > 255) maxSpeed = 255;
+  // PID dt (seconds)
+  const uint32_t now = micros();
+  float dt = (now - _lastPidMicros) * 1e-6f;
+  _lastPidMicros = now;
+  if (dt < 0.001f) dt = 0.001f;
 
-  left  = (left  >  maxSpeed) ?  maxSpeed : left;
-  left  = (left  < -maxSpeed) ? -maxSpeed : left;
-  right = (right >  maxSpeed) ?  maxSpeed : right;
-  right = (right < -maxSpeed) ? -maxSpeed : right;
+  const float e = (float)error;
 
-  // Apply to hardware
-  applyMotor((int16_t)left, (int16_t)right);
+  // Integral (anti-windup clamp)
+  _integral += e * dt;
+  if (_integral >  _integralLimitAbs) _integral =  _integralLimitAbs;
+  if (_integral < -_integralLimitAbs) _integral = -_integralLimitAbs;
 
-  // package result
-  MotorCommand cmd;
-  cmd.left = (int16_t)left;
-  cmd.right = (int16_t)right;
-  cmd.position = pos;
-  cmd.error = clampI16(err32, (int16_t)-32768, (int16_t)32767);
-  cmd.lineLost = lineLost;
-  return cmd;
+  float deriv = 0.0f;
+  if (_kd != 0.0f) {
+    deriv = (e - _lastDerivInput) / dt;
+    _lastDerivInput = e;
+  }
+
+  const float correction = (_kp * e) + (_ki * _integral) + (_kd * deriv);
+
+  const int32_t leftCmd  = (int32_t)baseSpeed + roundToInt_(correction);
+  const int32_t rightCmd = (int32_t)baseSpeed - roundToInt_(correction);
+
+  const int16_t maxAbs = (maxSpeed < 0) ? (int16_t)(-maxSpeed) : maxSpeed;
+
+  out.left  = clampMotor_(leftCmd,  maxAbs);
+  out.right = clampMotor_(rightCmd, maxAbs);
+
+  applyMotor(out.left, out.right);
+
+  _lastError = error;
+  return out;
 }
