@@ -90,7 +90,7 @@ tracer.setDirPolarity(false);
 ## Quick Start Example (Minimal)
 
 ```cpp
-#include <RiaLineTracerR4.h>
+#include <riaLineTracerR4.h>
 
 // Your sensor pin mapping
 const uint8_t sensorPins[] = { 5, A2, A0, 11, A3, 4 };
