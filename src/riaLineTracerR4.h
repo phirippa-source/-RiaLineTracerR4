@@ -1,134 +1,147 @@
 #pragma once
 #include <Arduino.h>
 
-/*
-  RiaLineTracerR4
-  - Arduino UNO R4 WiFi + Zumo Reflectance Sensor Array (RC timing)
-  - Optimized RC readRaw(): early-exit + pending mask
-  - Calibration + normalized readings (0..1000)
-  - readLineWithStatus() returns lineLost
-  - PID helper (anti-windup)
-  - Motor PWM drive as member functions (default Zumo Shield pins)
-  - Default emitterPin = 2
-*/
-
 class RiaLineTracerR4 {
 public:
-  struct MotorCommand {
-    int16_t left;     // -maxSpeed..+maxSpeed
-    int16_t right;    // -maxSpeed..+maxSpeed
-    int32_t position; // 0..(N-1)*1000
-    int16_t error;    // position - center
-    bool    lineLost; // true if line not detected
-  };
-
-  // emitterPin default is 2
-  RiaLineTracerR4(const uint8_t *sensorPins, uint8_t numSensors, int8_t emitterPin = 2);
-
-  void begin(bool emitterAlwaysOn = true);
-
-  // Calibration
-  void resetCalibration();
-  void calibrate(uint16_t iterations = 200,
-                 uint16_t timeoutMicros = 2500,
-                 uint8_t chargeMicros = 10,
-                 uint16_t interDelayMs = 5);
-
-  // Sensor I/O
-  uint16_t readRaw(uint16_t *rawValues,
-                   uint16_t timeoutMicros = 2500,
-                   uint8_t chargeMicros = 10);
-
-  void readCalibrated(uint16_t *calibratedValues,
-                      uint16_t timeoutMicros = 2500,
-                      uint8_t chargeMicros = 10);
-
-  int32_t readLine(bool whiteLine = false,
-                   uint16_t timeoutMicros = 2500,
-                   uint8_t chargeMicros = 10,
-                   uint16_t noiseThreshold = 50);
-
-  int32_t readLineWithStatus(bool &lineLost,
-                             bool whiteLine = false,
-                             uint16_t timeoutMicros = 2500,
-                             uint8_t chargeMicros = 10,
-                             uint16_t noiseThreshold = 50);
-
-  // PID
-  void setPID(float kp, float ki, float kd);
-  void setIntegralLimit(float limitAbs);
-  void resetPID();
-
-  // Line-lost strategy
-  void setHoldLastOnLost(bool enable);
-  void setSearchOnLost(bool enable);
-  void setSearchTurn(int16_t turn);
-
-  // Motor PWM (member)
-  void setMotorPins(uint8_t leftDirPin, uint8_t leftPwmPin,
-                    uint8_t rightDirPin, uint8_t rightPwmPin);
-  void setDirPolarity(bool lowIsForward);
-  void setMinPwmWhenMoving(uint8_t minPwm);
-
-  void applyMotor(int16_t left, int16_t right);
-
-  MotorCommand step(int16_t baseSpeed,
-                    int16_t maxSpeed,
-                    bool whiteLine = false,
-                    uint16_t timeoutMicros = 2500,
-                    uint8_t chargeMicros = 10,
-                    uint16_t noiseThreshold = 50);
-
-  // Accessors
-  uint8_t numSensors() const { return _numSensors; }
-  bool calibrated() const { return _calibrated; }
-  int32_t lastPosition() const { return _lastPosition; }
-  int8_t emitterPin() const { return _emitterPin; }
-
-private:
   static constexpr uint8_t MAX_SENSORS = 8;
 
-  // sensor core
-  uint8_t _numSensors;
-  int8_t  _emitterPin;
-  bool    _emitterAlwaysOn;
+  struct StepCommand {
+    bool    lineLost;
+    int32_t position;   // 0..(N-1)*1000
+    int32_t error;      // position - center
+    int16_t left;       // signed motor command
+    int16_t right;      // signed motor command
+  };
 
-  uint8_t  _pins[MAX_SENSORS];
+public:
+  // pins: sensor pins in LEFT->RIGHT order
+  // numSensors: number of sensors (<= MAX_SENSORS)
+  // emitterPin: IR emitter control pin (default 2)
+  explicit RiaLineTracerR4(const uint8_t* pins, uint8_t numSensors, int8_t emitterPin = 2);
+
+  // emitterAlwaysOn=true: keep emitter HIGH always after begin()
+  void begin(bool emitterAlwaysOn = true);
+
+  // -------------------- Sensor / Calibration --------------------
+  void resetCalibration();
+
+  // Read raw RC discharge times (microseconds) into values[]
+  void readRaw(uint16_t* values,
+               uint16_t timeoutMicros = 2000,
+               uint8_t  chargeMicros  = 10);
+
+  // Read calibrated values into values[] (0..1000)
+  void readCalibrated(uint16_t* values,
+                      uint16_t timeoutMicros = 2000,
+                      uint8_t  chargeMicros  = 10);
+
+  // Accumulate calibration data (min/max per sensor)
+  void calibrate(uint16_t iterations = 200,
+                 uint16_t timeoutMicros = 2000,
+                 uint8_t  chargeMicros  = 10,
+                 uint16_t interDelayMs  = 5);
+
+  // Line position only
+  int32_t readLine(bool whiteLine = false,
+                   uint16_t timeoutMicros = 2000,
+                   uint8_t  chargeMicros  = 10,
+                   uint16_t noiseThreshold = 140);
+
+  // Line position + lost flag (recommended)
+  int32_t readLineWithStatus(bool& lineLost,
+                            bool whiteLine = false,
+                            uint16_t timeoutMicros = 2000,
+                            uint8_t  chargeMicros  = 10,
+                            uint16_t noiseThreshold = 140);
+
+  // Auto calibration by spinning in-place (moves motors internally)
+  void autoCalibrateSpin(
+      uint16_t loops = 400,
+      int16_t  turnPwm = 130,
+      uint16_t block = 80,
+      uint16_t timeoutMicros = 2000,
+      uint8_t  chargeMicros = 10,
+      uint8_t  perLoopDelayMs = 10
+  );
+
+  // -------------------- PID --------------------
+  void setPID(float kp, float ki, float kd);
+  void resetPID();
+  void setIntegralLimit(float limitAbs);
+
+  // -------------------- Motor --------------------
+  // Default pins assume Zumo Shield style mapping:
+  // leftDir=D8, leftPwm=D10, rightDir=D7, rightPwm=D9
+  void setMotorPins(uint8_t leftDir, uint8_t leftPwm, uint8_t rightDir, uint8_t rightPwm);
+
+  // lowIsForward=true: DIR LOW=forward, HIGH=reverse
+  void setDirPolarity(bool lowIsForward);
+
+  // if abs(speed)>0, ensure pwm >= minPwm (helps overcome motor deadzone)
+  void setMinPwmWhenMoving(uint8_t minPwm);
+
+  // Apply signed motor commands (-255..255 typical). Internally uses PWM + DIR.
+  void applyMotor(int16_t left, int16_t right);
+
+  // -------------------- Lost-line behavior --------------------
+  void setSearchOnLost(bool enable);
+  void setHoldLastOnLost(bool enable);
+  void setSearchTurn(int16_t turnPwm);
+
+  // High-level control loop: read line -> PID -> mix -> applyMotor
+  StepCommand step(int16_t baseSpeed,
+                   int16_t maxSpeed,
+                   bool whiteLine = false,
+                   uint16_t timeoutMicros = 2000,
+                   uint8_t  chargeMicros  = 10,
+                   uint16_t noiseThreshold = 140);
+
+private:
+  // helpers
+  void ensureEmitterOnForRead_();
+  void emitterOn_();
+  void emitterOff_();
+
+  int16_t clampMotor_(int32_t v, int16_t maxAbs) const;
+  uint8_t clampPwmAbs_(int32_t v) const;
+  int32_t roundToInt_(float x) const;
+
+private:
+  // Sensors
+  uint8_t _numSensors;
+  uint8_t _pins[MAX_SENSORS];
+
+  // Emitter
+  int8_t _emitterPin;
+  bool   _emitterAlwaysOn;
+
+  // Calibration
   bool     _calibrated;
   uint16_t _calibMin[MAX_SENSORS];
   uint16_t _calibMax[MAX_SENSORS];
-  int32_t  _lastPosition;
 
-  void setEmitter(bool on);
-  uint16_t readRawInternal(uint16_t *values, uint16_t timeoutMicros, uint8_t chargeMicros);
+  // Line tracking
+  int32_t  _lastPosition;    // 0..(N-1)*1000
+  int32_t  _lastError;       // position-center
 
-  // PID core
-  float _kp, _ki, _kd;
-  float _integral;
-  float _prevError;
-  bool  _hasPrev;
-  float _integralLimitAbs;
+  // PID state
+  float    _kp, _ki, _kd;
+  float    _integral;
+  float    _integralLimitAbs;
+  float    _lastDerivInput;  // last error for derivative
+  uint32_t _lastPidMicros;
 
-  float pidUpdate(float error, float dtSeconds);
+  // Motor pins
+  uint8_t _leftDirPin;
+  uint8_t _leftPwmPin;
+  uint8_t _rightDirPin;
+  uint8_t _rightPwmPin;
 
-  // step timing
-  uint32_t _lastStepMicros;
-  float    _lastCorrection;
-
-  // lineLost strategy
-  bool   _holdLastOnLost;
-  bool   _searchOnLost;
-  int16_t _searchTurn;
-
-  // motor core
-  uint8_t _pinDirL, _pinPwmL;
-  uint8_t _pinDirR, _pinPwmR;
   bool    _dirLowIsForward;
   uint8_t _minPwmWhenMoving;
 
-  void initMotorPins();
-  void setOneMotor(uint8_t pinDir, uint8_t pinPwm, int16_t cmd);
-  uint8_t clampPwmFromCommand(int16_t cmd) const;
-
-  static int16_t clampI16(int32_t v, int16_t lo, int16_t hi);
+  // Lost-line policy
+  bool    _searchOnLost;
+  bool    _holdLastOnLost;
+  int16_t _searchTurnPwm;
 };
