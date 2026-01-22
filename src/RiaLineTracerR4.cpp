@@ -218,36 +218,9 @@ RiaLineTracerR4::LineResult RiaLineTracerR4::readLine(bool whiteLine,
                                                       uint16_t noiseThreshold)
 {
   uint16_t cal[MAX_SENSORS];
-  readCalibrated(cal, timeoutUs, chargeUs);
-
-  uint32_t weightedSum = 0;
-  uint32_t sum = 0;
-
-  for (uint8_t i = 0; i < _numSensors; i++) {
-    uint16_t v = cal[i];
-
-    // invert for white line
-    if (whiteLine) v = 1000 - v;
-
-    // ignore noise
-    if (v < noiseThreshold) continue;
-
-    weightedSum += (uint32_t)v * (uint32_t)(i * 1000UL);
-    sum += v;
-  }
-
-  LineResult out{};
-  if (sum == 0) {
-    out.lost = true;
-    out.position = _lastPosition;
-    return out;
-  }
-
-  out.lost = false;
-  out.position = (int32_t)(weightedSum / sum);
-  _lastPosition = out.position;
-  return out;
+  return readLineWithCal(cal, whiteLine, timeoutUs, chargeUs, noiseThreshold);
 }
+
 RiaLineTracerR4::LineResult RiaLineTracerR4::readLineWithCal(uint16_t* calValues,
                                                              bool whiteLine,
                                                              uint16_t timeoutUs,
