@@ -49,8 +49,7 @@ void connectWiFiSimple() {
     delay(500);
   }
 
-  // 질문에서 말씀하신 방식: localIP 호출 전 약간 delay
-  delay(500);
+  delay(500); // delay() 함수를 사용하지 않고, IP 주소를 받아 올 때까지 대기하는 코드로 변경 예정
 
   Serial.println();
   Serial.println("WiFi connected!");
@@ -123,8 +122,6 @@ void setup() {
   tracer.setPID(KP, KI, KD);
   tracer.setIntegralLimit(1500.0f);
   tracer.resetPID();
-
-  Serial.println("04_line_tracing_pid_udp READY");
 }
 
 void loop() {
@@ -145,16 +142,18 @@ void loop() {
   uint16_t cal[RiaLineTracerR4::MAX_SENSORS];
   auto line = tracer.readLineWithCal(cal); // 기본값 사용
 
-  // (2) 라인 이탈 처리(교육용 안전)
-  if (line.lost) {
+  // (2) 라인 이탈 처리(교육용 안전) 
+  // 또는 라인트레이서를 인위적으로 라인에서 제거(손으로 라인트레이서를 집어서 라인에서 제거)
+    if (line.lost) {
     tracer.stop();
 
-    // 송신 주기 맞을 때만 로그
+    // 이탈 시 정보 전송 1회 후
     if (nowMs == lastSendMs) {
       sendTelemetryCSV(seq++, nowMs, dtUs, true, line.position, 0, 0,
                        BASE_SPEED, MAX_SPEED, 0, 0, cal, tracer.sensorCount());
     }
-    return;
+    // 무한 루프.
+    while(ture) { delay(100); } 
   }
 
   // (3) 오차
