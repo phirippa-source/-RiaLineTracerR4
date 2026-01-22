@@ -419,3 +419,15 @@ void RiaLineTracerR4::applyMotor(int16_t left, int16_t right)
   digitalWrite(_rightDirPin, rightDirLevel);
   analogWrite(_rightPwmPin, rightPwm);
 }
+//-----------------------------------------------------------
+uint8_t RiaLineTracerR4::sensorCount() const
+{
+  return _numSensors;
+}
+
+int32_t RiaLineTracerR4::centerPosition() const
+{
+  if (_numSensors == 0) return 0;
+  return (int32_t)(_numSensors - 1) * 1000L / 2;
+}
+
