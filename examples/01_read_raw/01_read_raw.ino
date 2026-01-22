@@ -14,7 +14,7 @@ void loop() {
   tracer.readRaw(sensors_raw_value);    // 라인 검출 센서 6개로부터 Raw 값 읽기(us)
   
   for (int i = 0; i < tracer.sensorCount(); i++) {
-    Serial.print(raw[i]);
+    Serial.print(sensors_raw_value[i]);
     if (i < tracer.sensorCount() - 1) Serial.print('\t');
   }
   Serial.println();
